@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "paths": {
+      "@ai-support/shared": ["../../packages/shared/src"],
+      "@ai-support/database": ["../../packages/database/src"]
+    }
+  },
+  "include": ["src/**/*"]
+}

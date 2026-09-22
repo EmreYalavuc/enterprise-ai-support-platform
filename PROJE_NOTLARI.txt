@@ -1,0 +1,261 @@
+════════════════════════════════════════════════════════════════════════════════
+  ENTERPRISE AI CUSTOMER SUPPORT & AGENT PLATFORM — PROJE NOTLARI
+  Tarih: 2026-09-22 | Yazar: Emre Yalavuc
+════════════════════════════════════════════════════════════════════════════════
+
+Bu dosya projeyi geliştirirken öğrenilen kavramları ve alınan mimari kararları
+belgeler. Her phase tamamlandıkça güncellenir.
+
+────────────────────────────────────────────────────────────────────────────────
+PHASE 1: FOUNDATION — Tamamlandı
+────────────────────────────────────────────────────────────────────────────────
+
+── 1. PROJE NEDİR? ──────────────────────────────────────────────────────────
+
+Gerçek bir şirketin müşterilerine web üzerinden AI ile destek veren platform.
+Sadece bir chatbot değil — şirket verilerine erişebilen, sipariş sorgulayan,
+bilet açan, çok adımlı karar verebilen bir AI AGENT sistemi.
+
+── 2. MİMARİ KARARLAR ───────────────────────────────────────────────────────
+
+MONOREPO (npm workspaces + Turborepo)
+  Ne: Tüm servisler tek Git reposunda.
+  Neden: packages/shared'daki Message tipi hem API hem Worker'da kullanılır.
+         Tek kaynak, tutarsızlık imkansız. Ayrı repolar olsaydı tip değişince
+         her repoyu güncellemek gerekirdi.
+  Alternatif: Polyrepo (her servis ayrı repo) — büyük takımlarda tercih edilir
+              ama coordination overhead artar.
+
+PROVIDER-AGNOSTIC LLM KATMANI
+  Ne: Şu an Claude API, ama mimari OpenAI/Gemini'ye geçişe izin verir.
+  Neden: LLM sağlayıcıları değişebilir, fiyatlar değişir, yeni modeller çıkar.
+         Business logic LLM'e bağımlı olmamalı.
+  Nasıl: Ortak interface tanımla, provider-specific kod ayrı dosyalarda.
+
+── 3. TEKNOLOJİLER VE NEDENLERİ ────────────────────────────────────────────
+
+PostgreSQL — Ana Veritabanı
+  Neden: Konuşma geçmişi, kullanıcılar, biletler = ilişkisel veri.
+         JOIN lazım. ACID garantisi lazım (para veya kritik veri değişince
+         ya hepsi olur ya hiçbiri — transaction).
+  Neden MongoDB değil: İlişkisel veri için SQL çok daha uygun. JOIN yazmak
+                       yerine embedded document kullanmak bazen anlamsız.
+
+Redis — 3 Farklı Rol
+  1. Cache: Aynı soruya aynı gün ikinci kez LLM çağırma. Maliyet düşer.
+  2. Queue: BullMQ'nun backing store'u. Async job'lar burada bekler.
+  3. Rate Limiting: Sliding window counter. "Bu IP'den dakikada 10 istek."
+  Neden Redis: In-memory = çok hızlı. Persistence opsiyonel (AOF ile açtık).
+
+Qdrant — Vector Database (RAG için)
+  Neden gerekli: LLM bilgisi static (eğitim tarihi). Şirket dökümanları değil.
+  Nasıl çalışır:
+    "İade politikası nedir?" sorusu geldi
+    → "iade politikası" metni embedding'e çevrilir: [0.23, -0.87, 0.11, ...]
+    → Qdrant'ta en yakın vektörleri bul (cosine similarity)
+    → "Ürün İade ve Değişim Prosedürleri.pdf" bulundu
+    → Bu metin LLM'e context olarak verilir
+    → LLM şimdi şirkete özel bilgiyle cevap verebilir
+  Neden pgvector değil: pgvector PostgreSQL extension'ı, genel amaçlı.
+                        Qdrant bu iş için tasarlandı, 1M+ vektörde çok daha
+                        hızlı ve özellikli (payload filtering vb.)
+
+Node.js + TypeScript — API Katmanı
+  Neden: HTTP handler'lar, WebSocket, async I/O için ideal. npm ekosistemi
+         geniş. TypeScript ile büyük projede tip güvenliği şart.
+
+Python — Embedding Servisi (Phase 3'te gelecek)
+  Neden: sentence-transformers, langchain, pypdf Python ekosisteminde
+         çok daha olgun. ML işleri Python'da kalır.
+
+── 4. VERİTABANI ŞEMASI ─────────────────────────────────────────────────────
+
+Tablolar ve Amaçları:
+
+  companies       → Multi-tenant: bir platform, birden fazla şirket.
+                    api_key_hash: Asla plain-text key saklanmaz, sadece hash.
+
+  customers       → Şirketin müşterileri. external_id: şirketin kendi
+                    sistemindeki ID. WhatsApp'tan gelenler phone ile eşlenir.
+
+  conversations   → Her destek oturumu. channel: web/whatsapp/api.
+                    status: active → resolved veya escalated (insan devri).
+
+  messages        → Konuşma içindeki her mesaj. role: user/assistant/system/tool.
+                    tokens_input/output: Maliyet takibi için kritik.
+                    metadata: tool_calls, tool_results audit verisi.
+
+  documents       → Knowledge Base dökümanları (PDF, URL, metin).
+                    RAG pipeline bu tabloyu kullanır.
+
+  document_chunks → Döküman 500-1000 token'lık parçalara bölünür.
+                    Vektörler Qdrant'ta, metadata burada. Hybrid search için.
+
+  tickets         → Agent tool calling ile oluşturulan destek biletleri.
+                    external_ticket_id: gerçek sistemdeki Jira/Zendesk ID'si.
+
+  webhook_events  → Idempotency için. Aynı webhook iki kez gelirse sadece
+                    bir kez işle. UNIQUE constraint = DB garantisi.
+
+── 5. KRİTİK MÜHENDİSLİK KAVRAMLARI ────────────────────────────────────────
+
+CONNECTION POOL (packages/database/src/client.ts)
+  Problem: Her HTTP isteğinde yeni DB bağlantısı açmak:
+           a) Yavaş (TCP handshake + auth = ~50ms)
+           b) PostgreSQL için kaynak tüketen (max_connections sınırlı)
+  Çözüm: Pool 20 bağlantıyı açık tutar, gelen isteklere dağıtır.
+  Singleton pattern: Uygulama boyunca tek pool instance. Her çağrıda
+                     yeni pool oluşturulmaz.
+
+MIGRATION SİSTEMİ (packages/database/src/migrate.ts)
+  Problem: "Bende çalışıyor" ama başkasında schema farklı.
+  Çözüm: SQL dosyaları sırayla, transaction içinde çalıştırılır.
+         _migrations tablosu hangisinin çalıştığını bilir.
+  Kritik: SQL başarısız olursa ROLLBACK. Yarı uygulanmış schema = felaket.
+
+API KEY GÜVENLİĞİ (seed.ts)
+  Problem: DB sızdığında plain-text API key'ler ele geçirilir.
+  Çözüm: SHA-256 hash sakla. Doğrulama: gelen key'i hashle, karşılaştır.
+         Gerçek key bir kez gösterilir, bir daha alınamaz (GitHub gibi).
+
+GRACEFUL SHUTDOWN (apps/api/src/index.ts)
+  Problem: SIGTERM gelince aniden ölürse:
+           - Açık DB bağlantıları PostgreSQL'de "ghost connection" olur
+           - İşlenmekte olan request'ler yarıda kesilir
+  Çözüm: SIGTERM yakalanır → yeni bağlantı kabul etme → açıkları kapat
+         → 10 saniye timeout sonrası zorla kapat.
+
+HEALTH CHECK (/health endpoint)
+  Neden: Kubernetes/Docker readiness probe buraya bakar.
+         Load balancer sağlıksız instance'a trafik göndermez.
+  Format: Her servisin durumunu bağımsız raporla (database/redis/qdrant).
+          503 → load balancer bu instance'ı devre dışı bırakır.
+
+requireEnv() PATTERN (config/index.ts)
+  Problem: Eksik env var → uygulama başlar, 3 saat sonra production'da patlar.
+  Çözüm: Startup'ta tüm required env var'ları kontrol et. Eksikse crash et.
+  Prensip: Fail fast. Erken hata > geç hata.
+
+── 6. CHATBOT vs AGENT FARKI ────────────────────────────────────────────────
+
+CHATBOT (kural tabanlı):
+  Kullanıcı: "Siparişim nerede?"
+  Bot: "Sipariş numaranızı girin." → [hardcoded flow]
+  Kullanıcı: "ORD-123"
+  Bot: → checkOrder("ORD-123") → "Kargoda"
+  Problem: Öngörülmemiş soru = "Anlayamadım, lütfen tekrar deneyin."
+
+AGENT (LLM yönlendirir):
+  Kullanıcı: "Dün aldığım telefon hala gelmedi, iade de açmak istiyorum"
+  Agent düşünür:
+    1. getUserOrders(userId) → [ORD-456: iPhone, dün, kargoda]
+    2. getShipmentStatus("ORD-456") → "Teslimat gecikiyor"
+    3. createRefundRequest(orderId, reason="late_delivery")
+    4. sendEmail(user, "İade talebiniz oluşturuldu")
+  → LLM karar verdi ne yapacağına. Hiçbir adım hardcode edilmedi.
+
+── 7. RAG NEDEN GEREKLİ? ────────────────────────────────────────────────────
+
+LLM'in bilgisi eğitim tarihinde donmuş.
+Şirket politikaları, fiyatlar, ürünler her gün değişebilir.
+
+RAG olmadan:
+  Kullanıcı: "İade politikanız nedir?"
+  LLM: "Bunu bilemiyorum, müşteri hizmetleriyle iletişime geçin."
+
+RAG ile:
+  1. Kullanıcı sorusu embedding'e çevrilir
+  2. Qdrant'ta en alakalı döküman parçaları bulunur
+  3. Bu parçalar LLM'e "context" olarak verilir
+  4. LLM şirketin güncel bilgisiyle cevap verir
+
+RAG = Retrieval Augmented Generation
+    = Getir + Zenginleştir + Üret
+
+── 8. PRODUCTION EDGE CASE'LER (Zamanla Ekleyeceğiz) ───────────────────────
+
+LLM 429 (Rate Limit):
+  Claude/OpenAI rate limit döndürdü. Ne olur?
+  → Exponential backoff: 1s, 2s, 4s, 8s... tekrar dene
+  → Queue: hemen retry yerine kuyruğa al
+  → Kullanıcıya: "İsteğiniz işleniyor" (async pattern)
+
+Database Çökerse:
+  → Connection pool retry
+  → Circuit breaker (devre kesici): art arda 5 hata → 30s bekleme
+  → Queue'daki job'lar Redis'te kalır, DB gelince işlenir
+
+Worker Ölürse:
+  → BullMQ job'ları Redis'te persist edilmiş
+  → Worker restart edince kaldığı yerden devam eder
+  → "at-least-once" delivery garantisi
+
+Race Condition (webhook_events tablosu):
+  → Aynı webhook iki kez gelirse
+  → İki worker aynı anda INSERT yapmaya çalışır
+  → UNIQUE constraint → biri "unique violation" alır
+  → Sadece biri işler → idempotency sağlandı
+
+── 9. KLASÖR YAPISI ─────────────────────────────────────────────────────────
+
+enterprise-ai-support/
+├── apps/
+│   ├── api/              → Express API server (Node.js/TS)
+│   ├── worker/           → Async job işleyiciler (Phase 5'te)
+│   └── embedding-service/→ Python FastAPI, döküman işleme (Phase 3'te)
+├── packages/
+│   ├── shared/           → Ortak TypeScript tipleri
+│   └── database/         → DB client, migration, seed
+├── infrastructure/
+│   └── docker-compose.yml→ PostgreSQL, Redis, Qdrant
+├── .env.example          → Template (git'e commit edilir)
+├── .env                  → Gerçek secrets (.gitignore'da)
+└── PROJE_NOTLARI.txt     → Bu dosya
+
+── 10. PHASE PLANI ──────────────────────────────────────────────────────────
+
+Phase 1: Foundation ✅ TAMAMLANDI
+  → Monorepo, Docker, DB schema, migration, API server
+
+Phase 2: Core API + Auth (Sıradaki)
+  → JWT auth, API key auth, conversation endpoint'leri
+
+Phase 3: RAG Pipeline
+  → Python embedding service, Qdrant entegrasyonu,
+    döküman ingestion, semantic search
+
+Phase 4: AI Agent + Tool Calling
+  → Agent orchestrator, tool registry (mock şirket servisleri),
+    Claude API entegrasyonu, multi-turn conversation
+
+Phase 5: Queue + Worker
+  → BullMQ kurulum, AI processor worker,
+    async job handling, retry logic
+
+Phase 6: WhatsApp Webhook
+  → POST /webhooks/whatsapp, idempotency, rate limiting,
+    retry queue, authentication
+
+── 11. KURULUM KOMUTLARI ────────────────────────────────────────────────────
+
+# İlk kurulum
+npm install
+
+# Infrastructure (Docker gerekli)
+npm run infra:up
+
+# Database migration (tabloları oluştur)
+npm run db:migrate
+
+# Seed (test şirketi + API key üret)
+npm run db:seed
+
+# API'yi başlat
+npm run dev:api
+
+# Test
+curl http://localhost:3000/health
+
+════════════════════════════════════════════════════════════════════════════════
+  Bu dosya her phase sonunda güncellenecek.
+════════════════════════════════════════════════════════════════════════════════
